@@ -475,11 +475,39 @@ requestAnimationFrame(frame);
 var SUPABASE_URL='https://bccvjjtsiogmtankberh.supabase.co';
 var SUPABASE_ANON_KEY='sb_publishable_bvlWUjr7baA-RoblQRgMyQ_X3Lp_VmQ';
 var mode,lobby=null,room=null,round=0,myPick=null,myActs=[],cpuPick=null,cpuActs=[],started=false,over=false,busy=false,turn=0,S=[];
+var netRetryTimer=null,netWaitSince=0;
 function show(n){for(var i=0;i<3;i++)$('s'+i).hidden=i!==n;$('quit').hidden=n===0;}
-function pub(){if(room)room.presence({g:{pk:myPick||'',ac:myActs.join(''),r:round}}).catch(function(){});}
+function stopNetRetry(){if(netRetryTimer){clearInterval(netRetryTimer);netRetryTimer=null;}netWaitSince=0;}
+function currentNetState(){return{pk:myPick||'',ac:myActs.join(''),r:round,seq:++roomSeq};}
+var roomSeq=0;
+function broadcastCurrentState(){
+ if(!room)return;
+ var state=currentNetState();
+ room.presence({g:state}).catch(function(){});
+ if(room.broadcastState)room.broadcastState(state).catch(function(){});
+}
+function pub(){
+ if(!room)return;
+ broadcastCurrentState();
+ var waitingForPeer=(!started&&!!myPick)||(started&&!over&&myActs.length>turn);
+ if(waitingForPeer&&!netRetryTimer){
+  netWaitSince=Date.now();
+  netRetryTimer=setInterval(function(){
+   if(!room||over){stopNetRetry();return;}
+   var peer=getOpp();
+   var ready=started?(peer&&typeof peer.ac==='string'&&peer.ac.length>turn):(peer&&peer.pk&&BUG[peer.pk]);
+   if(ready){stopNetRetry();return;}
+   broadcastCurrentState();
+   if(Date.now()-netWaitSince>9000&&$('msg'))$('msg').textContent='通信が遅れています。相手の接続を確認しながら再送しています…';
+  },900);
+ }
+}
 function getOpp(){
  if(mode==='cpu')return cpuPick?{pk:cpuPick,ac:cpuActs.join('')}:null;
- if(!room)return null;var ps=room.peers();
+ if(!room)return null;
+ var remote=room.remoteState?room.remoteState():null;
+ if(remote&&remote.r===round&&typeof remote.ac==='string'&&/^[pwscx]{0,60}$/.test(remote.ac))return remote;
+ var ps=room.peers();
  for(var i=0;i<ps.length;i++){var p=ps[i],g=p.presence&&p.presence.g;
   if(!p.isMe&&p.kind==='viewer'&&g&&g.r===round&&typeof g.ac==='string'&&/^[pwscx]{0,60}$/.test(g.ac))return g;}
  return null;}
@@ -652,8 +680,8 @@ function btns(){var ok=started&&!over&&!busy&&myActs.length<=turn&&myActs.length
  document.querySelectorAll('.act').forEach(function(b){b.disabled=!ok||(b.dataset.a==='x'&&S[0].g<3);});}
 function tryGo(){
  if(over||busy)return;var g=getOpp();if(!g)return;
- if(!started){if(myPick&&g.pk&&BUG[g.pk])begin(myPick,g.pk);return;}
- if(myActs.length>turn&&g.ac.length>turn)resolveTurn(myActs[turn],g.ac[turn]);}
+ if(!started){if(myPick&&g.pk&&BUG[g.pk]){stopNetRetry();begin(myPick,g.pk);}return;}
+ if(myActs.length>turn&&g.ac.length>turn){stopNetRetry();resolveTurn(myActs[turn],g.ac[turn]);}}
 function begin(a,b){
  MushiAudio.play('start');MushiAudio.start();
  started=true;over=false;busy=false;turn=0;
@@ -754,7 +782,7 @@ function pick(id){
  myPick=id;
  if(mode==='cpu'){cpuPick=IDS[Math.floor(Math.random()*IDS.length)];begin(myPick,cpuPick);return;}
  $('n1').textContent='相手の虫えらびを待っています…(あなたは'+BUG[id].n+')';pub();tryGo();}
-function reset(){myPick=null;myActs=[];cpuPick=null;cpuActs=[];started=false;over=false;busy=false;turn=0;fx=[];dn=[];bn=null;dim=0;}
+function reset(){stopNetRetry();myPick=null;myActs=[];cpuPick=null;cpuActs=[];started=false;over=false;busy=false;turn=0;roomSeq=0;fx=[];dn=[];bn=null;dim=0;}
 $('bCpu').addEventListener('click',function(){mode='cpu';reset();buildCards();$('n1').textContent='';show(1);});
 $('bMk').addEventListener('click',function(){var s='';for(var i=0;i<4;i++)s+='abcdefghjkmnpqrstuvwxyz23456789'.charAt(Math.floor(Math.random()*31));$('code').value=s;});
 $('bNet').addEventListener('click',function(){
@@ -766,7 +794,7 @@ $('bNet').addEventListener('click',function(){
   $('n1').textContent='合言葉「'+code+'」で待機中。相手にも同じ合言葉を入れてもらってね。';show(1);pub();},
   function(){$('n0').textContent='接続できませんでした。もう一度ためしてください。';});});
 $('again').addEventListener('click',function(){round++;reset();buildCards();$('n1').textContent=mode==='net'?'相手もえらぶのを待ちます。':'';show(1);pub();});
-$('quit').addEventListener('click',function(){if(room){room.leave();room=null;}reset();show(0);$('n0').textContent='';});
+$('quit').addEventListener('click',function(){stopNetRetry();if(room){room.leave();room=null;}reset();show(0);$('n0').textContent='';});
 // 汎用Supabase Realtimeアダプター。DBテーブル不要でPresenceを使って2人の状態を同期。
 (function initOnline(){
  if(!window.supabase||!window.supabase.createClient||SUPABASE_URL.indexOf('YOUR_')===0||SUPABASE_ANON_KEY.indexOf('YOUR_')===0){
@@ -777,17 +805,26 @@ $('quit').addEventListener('click',function(){if(room){room.leave();room=null;}r
  var clientId='p-'+Math.random().toString(36).slice(2)+Date.now().toString(36);
  lobby={join:function(channelName){return new Promise(function(resolve,reject){
   var channel=client.channel(channelName,{config:{presence:{key:clientId},broadcast:{self:false}}});
-  var callbacks=[],joined=false;
+  var callbacks=[],joined=false,remoteState=null;
+  function notifyPeers(){callbacks.forEach(function(fn){try{fn();}catch(e){}});}
+  function acceptRemote(p){
+   if(!p||p.client_id===clientId||typeof p.r!=='number'||typeof p.ac!=='string'||!/^[pwscx]{0,60}$/.test(p.ac))return;
+   if(remoteState&&(p.r<remoteState.r||(p.r===remoteState.r&&Number(p.seq||0)<Number(remoteState.seq||0))))return;
+   remoteState=p;notifyPeers();
+  }
   var adapter={
    presence:function(payload){return channel.track({g:payload.g||{},client_id:clientId,kind:'viewer'});},
+   broadcastState:function(state){return channel.send({type:'broadcast',event:'game-state',payload:Object.assign({},state,{client_id:clientId})});},
+   remoteState:function(){return remoteState;},
    peers:function(){var state=channel.presenceState(),out=[];Object.keys(state).forEach(function(k){(state[k]||[]).forEach(function(v){out.push({isMe:v.client_id===clientId,kind:v.kind||'viewer',presence:v});});});return out;},
    onPeers:function(fn){callbacks.push(fn);},
-   leave:function(){channel.untrack().catch(function(){});return client.removeChannel(channel);}
+   leave:function(){stopNetRetry();channel.untrack().catch(function(){});return client.removeChannel(channel);}
   };
-  channel.on('presence',{event:'sync'},function(){callbacks.forEach(function(fn){try{fn();}catch(e){}});});
+  channel.on('presence',{event:'sync'},function(){notifyPeers();});
+  channel.on('broadcast',{event:'game-state'},function(message){acceptRemote(message&&message.payload);});
   channel.subscribe(function(status,err){
    if(status==='SUBSCRIBED'&&!joined){joined=true;adapter.presence({g:{}}).then(function(){resolve(adapter);},reject);}
-   else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){if(!joined)reject(err||new Error(status));}
+   else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){if(!joined)reject(err||new Error(status));else notifyPeers();}
   });
  });}};
  $('n0').textContent='ネット対戦の準備ができました。合言葉を共有して対戦できます。';
